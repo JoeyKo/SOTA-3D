@@ -51,12 +51,16 @@ logger = logging.getLogger(__name__)
 # ==================== 数据模型 ====================
 
 class GenerationResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
     success: bool
     model_url: Optional[str] = None
     generation_time: Optional[float] = None
     error: Optional[str] = None
 
 class TaskStatus(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
     task_id: str
     status: str  # queued, processing, completed, failed
     queue_position: Optional[int] = None

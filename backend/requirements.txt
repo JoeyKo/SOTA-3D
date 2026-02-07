@@ -15,6 +15,9 @@ torchvision==0.17.0
 # 图像处理
 Pillow==10.2.0
 
+# NumPy (锁定 1.x 版本，兼容 PyTorch)
+numpy<2.0
+
 # TRELLIS.2 模型依赖 (根据实际模型调整)
 # trellis-ai>=2.0.0
 # trimesh>=4.0.0

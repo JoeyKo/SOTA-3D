@@ -1,0 +1,50 @@
+# ============================================================
+# TRELLIS.2 + FastAPI - Docker Compose
+# ============================================================
+
+services:
+  trellis-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trellis-3d-api
+    restart: unless-stopped
+
+    # GPU 直通
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # 模型权重持久化（避免每次重建容器重新下载）
+      - model-cache:/app/models
+      # 生成的 GLB 文件存储
+      - ./output:/app/TRELLIS.2/static
+      # 日志持久化
+      - ./logs:/app/TRELLIS.2/logs
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OPENCV_IO_ENABLE_OPENEXR=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HF_HOME=/app/models
+
+    # 模型加载较慢，健康检查宽容
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+volumes:
+  model-cache:
+    name: trellis-model-cache

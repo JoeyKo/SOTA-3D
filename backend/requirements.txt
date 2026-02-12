@@ -1,4 +1,6 @@
-# 3D AI 生成平台 - 后端依赖
+# 3D AI 生成平台 - 额外 Web 依赖
+# 注意: TRELLIS.2 核心依赖 (torch, trellis2, o_voxel 等) 由 conda 环境管理
+# 以下仅为 FastAPI 服务所需的额外包
 
 # Web 框架
 fastapi==0.109.0
@@ -8,20 +10,8 @@ python-multipart==0.0.6
 # 数据验证
 pydantic==2.5.3
 
-# PyTorch (CUDA 12.4)
-torch==2.2.0
-torchvision==0.17.0
-
 # 图像处理
-Pillow==10.2.0
-
-# NumPy (锁定 1.x 版本，兼容 PyTorch)
-numpy<2.0
-
-# TRELLIS.2 模型依赖 (根据实际模型调整)
-# trellis-ai>=2.0.0
-# trimesh>=4.0.0
-# pygltflib>=1.16.0
+Pillow>=10.2.0
 
 # 其他
 aiofiles==23.2.1

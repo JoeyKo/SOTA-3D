@@ -4,6 +4,10 @@
 """
 
 import os
+# TRELLIS.2 所需环境变量（必须在其他导入之前设置）
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import uuid
 import asyncio
 import logging
@@ -11,14 +15,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
+from logging.handlers import TimedRotatingFileHandler
 
 import torch
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from PIL import Image
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import time
+
+# TRELLIS.2 核心依赖
+from trellis2.pipelines import Trellis2ImageTo3DPipeline
+import o_voxel
 
 # ==================== 配置 ====================
 
@@ -36,13 +46,26 @@ REQUEST_TIMEOUT = 180  # 秒
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
+# GLB 导出配置
+GLB_DECIMATION_TARGET = 1000000
+GLB_TEXTURE_SIZE = 4096
+
 # ==================== 日志配置 ====================
+
+log_handler = TimedRotatingFileHandler(
+    LOGS_DIR / "app.log",
+    when="midnight",
+    interval=1,
+    backupCount=7,
+    encoding="utf-8"
+)
+log_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOGS_DIR / "app.log"),
+        log_handler,
         logging.StreamHandler()
     ]
 )
@@ -58,7 +81,7 @@ class GenerationResponse(BaseModel):
     generation_time: Optional[float] = None
     error: Optional[str] = None
 
-class TaskStatus(BaseModel):
+class TaskStatusModel(BaseModel):
     model_config = {"protected_namespaces": ()}
     
     task_id: str
@@ -72,9 +95,9 @@ class TaskStatus(BaseModel):
 
 class AppState:
     def __init__(self):
-        self.model = None
+        self.pipeline = None  # TRELLIS.2 推理管线
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
-        self.tasks: dict[str, TaskStatus] = {}
+        self.tasks: dict[str, TaskStatusModel] = {}
         self.processing_lock = asyncio.Lock()
         self.is_processing = False
 
@@ -82,30 +105,25 @@ app_state = AppState()
 
 # ==================== 模型加载 ====================
 
-def load_trellis_model():
-    """加载 TRELLIS.2 模型到 GPU"""
-    logger.info("正在加载 TRELLIS.2 模型...")
+def load_trellis_model() -> Trellis2ImageTo3DPipeline:
+    """加载 TRELLIS.2-4B 模型到 GPU（Warm-up）"""
+    logger.info("正在加载 TRELLIS.2-4B 模型...")
     
     try:
-        # TODO: 替换为实际的 TRELLIS.2 模型加载代码
-        # from trellis import TrellisModel
-        # model = TrellisModel.from_pretrained("trellis-2-4b")
-        # model = model.to("cuda")
-        # model.eval()
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        pipeline.cuda()
         
-        # 模拟模型加载（实际使用时删除）
-        logger.info("⚠️ 当前为模拟模式，请替换为实际 TRELLIS.2 模型加载代码")
-        
-        logger.info(f"模型加载完成，显存占用: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-        return None  # 返回实际模型对象
+        vram_used = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"✅ 模型加载完成，显存占用: {vram_used:.2f} GB")
+        return pipeline
         
     except Exception as e:
-        logger.error(f"模型加载失败: {e}")
+        logger.error(f"❌ 模型加载失败: {e}", exc_info=True)
         raise
 
 def generate_3d_model(image_path: Path, output_path: Path) -> bool:
     """
-    调用 TRELLIS.2 生成 3D 模型
+    调用 TRELLIS.2 生成 3D 模型并导出 GLB
     
     Args:
         image_path: 输入图片路径
@@ -118,25 +136,81 @@ def generate_3d_model(image_path: Path, output_path: Path) -> bool:
         logger.info(f"开始生成 3D 模型: {image_path}")
         start_time = time.time()
         
-        # TODO: 替换为实际的 TRELLIS.2 推理代码
-        # from PIL import Image
-        # image = Image.open(image_path)
-        # mesh = app_state.model.generate(image)
-        # mesh.export(output_path)
+        # 1. 加载图片
+        image = Image.open(image_path)
+        logger.info(f"图片尺寸: {image.size}, 模式: {image.mode}")
         
-        # 模拟生成过程（实际使用时删除）
-        import time
-        time.sleep(5)  # 模拟 5 秒生成时间
+        # 2. 运行推理管线
+        logger.info("正在运行 TRELLIS.2 推理...")
+        mesh = app_state.pipeline.run(image)[0]
         
-        # 创建一个空的 GLB 文件作为占位符（实际使用时删除）
-        output_path.write_bytes(b"placeholder")
+        # 3. 简化网格（nvdiffrast 限制）
+        mesh.simplify(16777216)
+        logger.info("网格简化完成")
+        
+        # 4. 导出 GLB
+        logger.info("正在导出 GLB 文件...")
+        glb = o_voxel.postprocess.to_glb(
+            vertices=mesh.vertices,
+            faces=mesh.faces,
+            attr_volume=mesh.attrs,
+            coords=mesh.coords,
+            attr_layout=mesh.layout,
+            voxel_size=mesh.voxel_size,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=GLB_DECIMATION_TARGET,
+            texture_size=GLB_TEXTURE_SIZE,
+            remesh=True,
+            remesh_band=1,
+            remesh_project=0,
+            verbose=True
+        )
+        glb.export(str(output_path), extension_webp=True)
         
         elapsed = time.time() - start_time
-        logger.info(f"3D 模型生成完成，耗时: {elapsed:.2f}s")
+        file_size_mb = output_path.stat().st_size / (1024 * 1024)
+        logger.info(f"✅ 3D 模型生成完成，耗时: {elapsed:.2f}s，文件大小: {file_size_mb:.2f} MB")
         return True
         
+    except torch.cuda.OutOfMemoryError:
+        logger.warning("⚠️ 显存不足，正在清理并重试...")
+        torch.cuda.empty_cache()
+        
+        try:
+            # 重试一次
+            image = Image.open(image_path)
+            mesh = app_state.pipeline.run(image)[0]
+            mesh.simplify(16777216)
+            
+            glb = o_voxel.postprocess.to_glb(
+                vertices=mesh.vertices,
+                faces=mesh.faces,
+                attr_volume=mesh.attrs,
+                coords=mesh.coords,
+                attr_layout=mesh.layout,
+                voxel_size=mesh.voxel_size,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target=GLB_DECIMATION_TARGET,
+                texture_size=GLB_TEXTURE_SIZE,
+                remesh=True,
+                remesh_band=1,
+                remesh_project=0,
+                verbose=True
+            )
+            glb.export(str(output_path), extension_webp=True)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"✅ 重试成功，3D 模型生成完成，耗时: {elapsed:.2f}s")
+            return True
+            
+        except Exception as retry_err:
+            logger.error(f"❌ 重试仍然失败: {retry_err}", exc_info=True)
+            torch.cuda.empty_cache()
+            return False
+        
     except Exception as e:
-        logger.error(f"3D 模型生成失败: {e}")
+        logger.error(f"❌ 3D 模型生成失败: {e}", exc_info=True)
+        torch.cuda.empty_cache()
         return False
 
 # ==================== 生命周期管理 ====================
@@ -146,7 +220,7 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时加载模型
     logger.info("=== 服务启动 ===")
-    app_state.model = load_trellis_model()
+    app_state.pipeline = load_trellis_model()
     
     # 启动后台任务处理器
     asyncio.create_task(process_queue())
@@ -162,7 +236,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="3D AI 生成平台",
-    description="基于 TRELLIS.2 的图片转 3D 模型服务",
+    description="基于 TRELLIS.2-4B 的图片转 3D 模型服务",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -222,7 +296,7 @@ async def process_queue():
                         app_state.tasks[task_id].error = "Generation failed"
                         
                 except Exception as e:
-                    logger.error(f"任务 {task_id} 处理失败: {e}")
+                    logger.error(f"任务 {task_id} 处理失败: {e}", exc_info=True)
                     if task_id in app_state.tasks:
                         app_state.tasks[task_id].status = "failed"
                         app_state.tasks[task_id].error = str(e)
@@ -236,7 +310,7 @@ async def process_queue():
                     app_state.queue.task_done()
                     
         except Exception as e:
-            logger.error(f"队列处理器异常: {e}")
+            logger.error(f"队列处理器异常: {e}", exc_info=True)
             await asyncio.sleep(1)
 
 def update_queue_positions():
@@ -252,9 +326,19 @@ def update_queue_positions():
 @app.get("/")
 async def root():
     """健康检查"""
+    gpu_info = "N/A"
+    vram_info = "N/A"
+    if torch.cuda.is_available():
+        gpu_info = torch.cuda.get_device_name(0)
+        vram_used = torch.cuda.memory_allocated() / 1024**3
+        vram_total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        vram_info = f"{vram_used:.1f}GB / {vram_total:.1f}GB"
+    
     return {
         "status": "running",
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
+        "model": "TRELLIS.2-4B",
+        "gpu": gpu_info,
+        "vram": vram_info,
         "queue_size": app_state.queue.qsize(),
         "is_processing": app_state.is_processing
     }
@@ -266,6 +350,7 @@ async def generate(image: UploadFile = File(...)):
     
     - 支持格式: JPG, PNG, WebP
     - 最大文件大小: 10MB
+    - 返回生成的 GLB 文件下载链接
     """
     start_time = time.time()
     
@@ -305,51 +390,47 @@ async def generate(image: UploadFile = File(...)):
     
     # 创建任务状态
     queue_position = app_state.queue.qsize() + 1
-    app_state.tasks[task_id] = TaskStatus(
+    app_state.tasks[task_id] = TaskStatusModel(
         task_id=task_id,
         status="queued",
-        queue_position=queue_position if not app_state.is_processing else queue_position
+        queue_position=queue_position
     )
     
     # 加入队列
     await app_state.queue.put((task_id, temp_image_path))
     
-    # 如果没有正在处理的任务，等待当前任务完成
-    if not app_state.is_processing or app_state.queue.qsize() == 1:
-        # 等待任务完成（最多等待 REQUEST_TIMEOUT 秒）
-        for _ in range(REQUEST_TIMEOUT * 2):
-            await asyncio.sleep(0.5)
-            task = app_state.tasks.get(task_id)
-            if task and task.status in ("completed", "failed"):
-                break
-        
+    # 等待任务完成（最多等待 REQUEST_TIMEOUT 秒）
+    for _ in range(REQUEST_TIMEOUT * 2):
+        await asyncio.sleep(0.5)
         task = app_state.tasks.get(task_id)
-        if task:
-            if task.status == "completed":
-                generation_time = time.time() - start_time
-                return GenerationResponse(
-                    success=True,
-                    model_url=task.model_url,
-                    generation_time=generation_time
-                )
-            elif task.status == "failed":
-                return GenerationResponse(
-                    success=False,
-                    error=task.error or "Generation failed"
-                )
+        if task and task.status in ("completed", "failed"):
+            break
     
-    # 如果队列中有其他任务，返回任务 ID 让客户端轮询
+    task = app_state.tasks.get(task_id)
+    if task:
+        if task.status == "completed":
+            generation_time = time.time() - start_time
+            return GenerationResponse(
+                success=True,
+                model_url=task.model_url,
+                generation_time=round(generation_time, 2)
+            )
+        elif task.status == "failed":
+            return GenerationResponse(
+                success=False,
+                error=task.error or "Generation failed"
+            )
+    
+    # 超时 - 返回任务 ID 让客户端轮询
     return GenerationResponse(
         success=True,
         model_url=None,
-        error=f"Task queued. Use /api/status/{task_id} to check progress."
+        error=f"Generation timeout. Use /api/status/{task_id} to check progress."
     )
 
 @app.get("/api/status/{task_id}")
 async def get_status(task_id: str):
-    """
-    获取任务状态（支持 SSE）
-    """
+    """获取任务状态"""
     task = app_state.tasks.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -358,14 +439,12 @@ async def get_status(task_id: str):
 
 @app.get("/api/status/{task_id}/stream")
 async def get_status_stream(task_id: str):
-    """
-    SSE 端点：实时推送任务状态
-    """
+    """SSE 端点：实时推送任务状态"""
     async def event_generator():
         while True:
             task = app_state.tasks.get(task_id)
             if not task:
-                yield f"data: {{'error': 'Task not found'}}\n\n"
+                yield f"data: {{\"error\": \"Task not found\"}}\n\n"
                 break
             
             yield f"data: {task.model_dump_json()}\n\n"

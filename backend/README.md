@@ -1,13 +1,16 @@
 # 3D AI 生成平台 - 后端服务
 
-基于 TRELLIS.2 模型的图片转 3D 模型 API 服务。
+基于 TRELLIS.2-4B 模型的图片转 3D 模型 API 服务。
 
-## 快速启动
+## 快速启动 (Docker)
+
+> **前提**: GPU 服务器上已安装 Docker 和 NVIDIA Container Toolkit（详见 [DEPLOY.md](./DEPLOY.md)）
 
 ```bash
-cd /Users/kojoey/SOTA\ 3D/backend
-chmod +x start.sh
-./start.sh
+# 上传到 GPU 服务器后
+cd ~/trellis-api
+docker compose build    # 首次约 30-60 分钟
+docker compose up -d    # 后台启动
 ```
 
 ## 环境要求
@@ -17,7 +20,7 @@ chmod +x start.sh
 | GPU | NVIDIA RTX 4090 (24GB VRAM) |
 | OS | Ubuntu 22.04 LTS |
 | CUDA | 12.4 |
-| Python | 3.10+ |
+| Python | 3.10+ (conda trellis2 环境) |
 
 ## API 接口
 
@@ -25,6 +28,7 @@ chmod +x start.sh
 ```
 GET /
 ```
+返回 GPU 状态、显存使用、队列信息。
 
 ### 生成 3D 模型
 ```
@@ -34,13 +38,14 @@ Body: { image: File }
 ```
 
 **支持格式**: JPG, PNG, WebP  
-**最大文件**: 10MB
+**最大文件**: 10MB  
+**推理耗时**: 30-90 秒
 
 **响应示例**:
 ```json
 {
   "success": true,
-  "model_url": "/static/xxx.glb",
+  "model_url": "/static/550e8400-e29b-41d4-a716-446655440000.glb",
   "generation_time": 45.2
 }
 ```
@@ -50,9 +55,14 @@ Body: { image: File }
 GET /api/status/{task_id}
 ```
 
-### SSE 实时状态
+### SSE 实时状态流
 ```
 GET /api/status/{task_id}/stream
+```
+
+### 取消任务
+```
+DELETE /api/task/{task_id}
 ```
 
 ## 访问地址
@@ -65,15 +75,20 @@ GET /api/status/{task_id}/stream
 
 ```
 backend/
-├── main.py          # 核心代码
-├── requirements.txt # 依赖
-├── start.sh         # 启动脚本
-├── static/          # 生成的模型存放
-└── logs/            # 日志目录
+├── Dockerfile           # Docker 构建文件
+├── docker-compose.yml   # Docker Compose 编排
+├── .dockerignore        # 构建忽略
+├── main.py              # FastAPI 核心服务 + TRELLIS.2 推理
+├── requirements.txt     # FastAPI 额外依赖（核心依赖由 Docker 构建）
+├── start.sh             # 非 Docker 启动脚本（备用）
+├── DEPLOY.md            # 完整 Docker 部署指南
+├── output/              # 生成的 GLB 模型存放（Docker Volume 映射）
+└── logs/                # 日志目录
 ```
 
-## ⚠️ 注意事项
+## 注意事项
 
-1. **模型集成**: 在 `main.py` 中搜索 `TODO`，替换为实际的 TRELLIS.2 模型代码
-2. **当前为模拟模式**: 生成会延迟 5 秒，输出占位符文件
-3. **并发限制**: 同时只处理 1 个请求，队列最多 5 个
+1. **必须在 TRELLIS.2 仓库目录下运行**：推理依赖 `trellis2` 和 `o_voxel` 包
+2. **并发限制**: 同时只处理 1 个请求，队列最多 5 个
+3. **显存**: 模型常驻约 18.5GB，推理时峰值更高
+4. **文件清理**: 建议配置 cron 定时清理 `static/` 下的旧文件

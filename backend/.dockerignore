@@ -1,0 +1,12 @@
+# 排除不需要的文件
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+logs/
+static/
+output/
+*.md
+!requirements.txt
+start.sh
